@@ -2,6 +2,17 @@ require("dotenv").config();
 const { Telegraf, Markup, session } = require("telegraf");
 const mongoose = require("mongoose");
 const schedule = require("node-schedule");
+// Helper function to escape HTML
+const escapeHtml = (text) => {
+  return text.replace(/[<>&]/g, function(c) {
+    return {
+      '<': '&lt;',
+      '>': '&gt;',
+      '&': '&amp;'
+    }[c];
+  });
+};
+
 
 // Initialize bot with session middleware
 const bot = new Telegraf(process.env.BOT_TOKEN);
@@ -17,7 +28,10 @@ bot.use(session({
     sentBroadcastMessages: []
   })
 }));
-
+mongoose.connection.on('connecting', () => console.log('Connecting to MongoDB...'));
+mongoose.connection.on('connected', () => console.log('Connected to MongoDB'));
+mongoose.connection.on('error', (err) => console.error('MongoDB connection error:', err));
+mongoose.connection.on('disconnected', () => console.log('Disconnected from MongoDB'));
 // Suppress punycode warning
 process.removeAllListeners('warning');
 
@@ -28,6 +42,7 @@ const MESSAGE_DELETE_MINUTES = parseInt(process.env.MESSAGE_DELETE_MINUTES) || 3
 const PURCHASE_GROUP_LINK = process.env.PURCHASE_GROUP_LINK || "https://t.me/yourpurchasegroup";
 const PURCHASE_GROUP_PRICE = process.env.PURCHASE_GROUP_PRICE || "₹99";
 const GROUP_LINK = process.env.GROUP_LINK || "https://t.me/yourgroup";
+let CHANNEL_IDS = process.env.CHANNEL_IDS ? process.env.CHANNEL_IDS.split(',') : [];
 
 // MongoDB Connection
 mongoose.connect(process.env.MONGO_URI)
@@ -59,12 +74,23 @@ const broadcastSchema = new mongoose.Schema({
   messageId: Number,
   chatId: Number,
   content: Object,
+  targetType: String, // 'user', 'group', or 'channel'
   sentAt: { type: Date, default: Date.now }
+});
+
+const channelSchema = new mongoose.Schema({
+  channelId: { type: String, required: true, unique: true },
+  title: { type: String, required: true },
+  username: String,
+  inviteLink: String,
+  addedAt: { type: Date, default: Date.now },
+  addedBy: { type: Number, required: true } // Telegram user ID of admin who added it
 });
 
 const User = mongoose.model("User", userSchema);
 const Video = mongoose.model("Video", videoSchema);
 const Broadcast = mongoose.model("Broadcast", broadcastSchema);
+const Channel = mongoose.model("Channel", channelSchema);
 
 // Helper functions
 const isAdmin = (userId) => admins.includes(userId.toString());
@@ -260,6 +286,7 @@ const showAdminMenu = async (ctx) => {
     [Markup.button.callback("📢 Broadcast Message", "ADMIN_BROADCAST_TEXT")],
     [Markup.button.callback("📷 Broadcast Media", "ADMIN_BROADCAST_MEDIA")],
     [Markup.button.callback("🎥 Upload Media", "ADMIN_UPLOAD_MEDIA")],
+    [Markup.button.callback("📺 Manage Channels", "ADMIN_MANAGE_CHANNELS")],
     [Markup.button.callback("🗑 Delete Broadcast", "ADMIN_DELETE_BROADCAST")],
     [Markup.button.callback("📊 Stats", "ADMIN_STATS")],
     [Markup.button.callback("🔙 Main Menu", "MAIN_MENU")]
@@ -435,7 +462,7 @@ bot.action("ADMIN_BROADCAST_TEXT", async (ctx) => {
   ctx.session.waitingForBroadcast = "text";
   ctx.session.currentMenu = 'broadcast';
 
-  await ctx.reply("📢 Enter the broadcast message (or /cancel to abort):\n\nYou can mention:\n- @allusers (for all users)\n- @allgroups (for all groups)", 
+  await ctx.reply("📢 Enter the broadcast message (or /cancel to abort):\n\nYou can mention:\n- @allusers (for all users)\n- @allgroups (for all groups)\n- @allchannels (for all channels)", 
     Markup.inlineKeyboard([
       Markup.button.callback("❌ Cancel", "ADMIN_CANCEL")
     ])
@@ -449,9 +476,10 @@ bot.on("text", async (ctx) => {
 
   if (ctx.session.waitingForBroadcast === "text") {
     const buttons = [
-      [Markup.button.callback("✅ Broadcast to Users", "CONFIRM_BROADCAST_TEXT_USERS")],
-      [Markup.button.callback("📢 Broadcast to Groups", "CONFIRM_BROADCAST_TEXT_GROUPS")],
-      [Markup.button.callback("🌐 Broadcast to Both", "CONFIRM_BROADCAST_TEXT_BOTH")],
+      [Markup.button.callback("👤 Users", "CONFIRM_BROADCAST_TEXT_USERS")],
+      [Markup.button.callback("👥 Groups", "CONFIRM_BROADCAST_TEXT_GROUPS")],
+      [Markup.button.callback("📺 Channels", "CONFIRM_BROADCAST_TEXT_CHANNELS")],
+      [Markup.button.callback("🌐 All", "CONFIRM_BROADCAST_TEXT_ALL")],
       [Markup.button.callback("❌ Cancel", "ADMIN_CANCEL")]
     ];
 
@@ -529,9 +557,10 @@ bot.on(["photo", "video", "document"], async (ctx) => {
                   ctx.message.document?.file_id;
 
     const buttons = [
-      [Markup.button.callback("✅ Broadcast to Users", "CONFIRM_BROADCAST_MEDIA_USERS")],
-      [Markup.button.callback("📢 Broadcast to Groups", "CONFIRM_BROADCAST_MEDIA_GROUPS")],
-      [Markup.button.callback("🌐 Broadcast to Both", "CONFIRM_BROADCAST_MEDIA_BOTH")],
+      [Markup.button.callback("👤 Users", "CONFIRM_BROADCAST_MEDIA_USERS")],
+      [Markup.button.callback("👥 Groups", "CONFIRM_BROADCAST_MEDIA_GROUPS")],
+      [Markup.button.callback("📺 Channels", "CONFIRM_BROADCAST_MEDIA_CHANNELS")],
+      [Markup.button.callback("🌐 All", "CONFIRM_BROADCAST_MEDIA_ALL")],
       [Markup.button.callback("❌ Cancel", "ADMIN_CANCEL")]
     ];
 
@@ -550,7 +579,388 @@ bot.on(["photo", "video", "document"], async (ctx) => {
   }
 });
 
-// Broadcast execution handlers
+// Channel management
+bot.action("ADMIN_MANAGE_CHANNELS", async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return;
+
+  clearMenuState(ctx);
+  ctx.session.currentMenu = 'manage_channels';
+
+  const channels = await Channel.find();
+  const buttons = [
+    [Markup.button.callback("➕ Add Channel", "ADD_CHANNEL")],
+    [Markup.button.callback("➖ Remove Channel", "REMOVE_CHANNEL")],
+    [Markup.button.callback("📋 List Channels", "LIST_CHANNELS")],
+    [Markup.button.callback("🔙 Back", "ADMIN_CANCEL")]
+  ];
+
+  await ctx.reply(
+    "📺 Channel Management",
+    Markup.inlineKeyboard(buttons)
+  );
+});
+
+// Updated ADD_CHANNEL handler
+// Add Channel - Initiation
+  // Add Channel Command
+// 1. First, add this enhanced debug utility at the top of your file:
+const fs = require('fs');
+const debug = {
+  log: (...args) => {
+    const message = `[DEBUG][${new Date().toISOString()}] ${args.join(' ')}\n`;
+    console.log(message);
+    fs.appendFileSync('bot_debug.log', message);
+  },
+  error: (...args) => {
+    const message = `[ERROR][${new Date().toISOString()}] ${args.join(' ')}\n`;
+    console.error(message);
+    fs.appendFileSync('bot_errors.log', message);
+  }
+};
+
+// 2. Replace your channel management code with this:
+
+// Add Channel Command
+bot.action("ADD_CHANNEL", async (ctx) => {
+  try {
+    if (!isAdmin(ctx.from.id)) {
+      debug.log('Non-admin access attempt to ADD_CHANNEL by:', ctx.from.id);
+      return ctx.answerCbQuery("❌ Admin only");
+    }
+
+    // Clear previous state and set new
+    ctx.session = ctx.session || {};
+    ctx.session.waitingForChannelAdd = true;
+    ctx.session.currentMenu = 'add_channel';
+
+    debug.log('Admin started channel addition:', ctx.from.id, 'Session:', ctx.session);
+
+    await ctx.reply(
+      `📢 <b>How to add a channel:</b>\n\n` +
+      `1. Add @${ctx.botInfo.username} as admin to your channel\n` +
+      `2. Make sure bot has <b>post messages</b> permission\n` +
+      `3. <b>Forward</b> any message from that channel here\n\n` +
+      `<b>OR</b> send the channel ID (like @channelname or -1001234567890)\n\n` +
+      `<i>Current status: Waiting for channel info...</i>`,
+      {
+        parse_mode: 'HTML',
+        ...Markup.inlineKeyboard([
+          Markup.button.callback("❌ Cancel", "ADMIN_CANCEL")
+        ]),
+        disable_web_page_preview: true
+      }
+    );
+
+    await ctx.answerCbQuery();
+  } catch (error) {
+    debug.error('ADD_CHANNEL command failed:', error);
+    await ctx.reply('⚠️ Error starting channel addition');
+  }
+});
+
+// Channel Message Handler
+bot.on('message', async (ctx) => {
+  try {
+    debug.log('Received message:', {
+      text: ctx.message.text,
+      forwardFrom: ctx.message.forward_from_chat,
+      from: ctx.from.id,
+      session: ctx.session
+    });
+
+    // Skip if not in channel add mode or not from admin
+    if (!ctx.session?.waitingForChannelAdd || !isAdmin(ctx.from.id)) {
+      debug.log('Skipping message - not in channel add mode');
+      return;
+    }
+
+    let channelId, title, username;
+
+    // Handle forwarded messages
+    if (ctx.message.forward_from_chat?.type === 'channel') {
+      debug.log('Processing forwarded channel message');
+      channelId = ctx.message.forward_from_chat.id.toString();
+      title = ctx.message.forward_from_chat.title || "Unnamed Channel";
+      username = ctx.message.forward_from_chat.username;
+    } 
+    // Handle direct text input
+    else if (ctx.message.text) {
+      const input = ctx.message.text.trim();
+      debug.log('Processing channel ID input:', input);
+
+      if (!/^(@\w+|-\d+)$/.test(input)) {
+        await ctx.reply('⚠️ Please use @channelname or -1001234567890 format');
+        return;
+      }
+
+      try {
+        const chat = await ctx.telegram.getChat(input);
+        if (chat.type !== 'channel') {
+          await ctx.reply('⚠️ This is not a channel');
+          return;
+        }
+        channelId = chat.id.toString();
+        title = chat.title || "Unnamed Channel";
+        username = chat.username;
+      } catch (error) {
+        debug.error('Channel lookup failed:', error);
+        await ctx.reply('⚠️ Could not find channel. Make sure:\n1. Channel exists\n2. Bot is admin\n3. ID is correct');
+        return;
+      }
+    } else {
+      debug.log('Ignoring message - not a channel message');
+      return;
+    }
+
+    // Verify bot is admin in channel
+    try {
+      debug.log('Checking bot admin status in channel:', channelId);
+      const botMember = await ctx.telegram.getChatMember(channelId, ctx.botInfo.id);
+
+      if (!['administrator', 'creator'].includes(botMember.status)) {
+        await ctx.reply('❌ Bot must be admin with post permissions');
+        return;
+      }
+    } catch (error) {
+      debug.error('Admin check failed:', error);
+      await ctx.reply('⚠️ Could not verify admin status. Please add bot as admin first');
+      return;
+    }
+
+    // Check if channel exists
+    const existing = await Channel.findOne({ channelId });
+    if (existing) {
+      await ctx.reply(`ℹ️ Channel "${title}" already exists`);
+      return;
+    }
+
+    // Create invite link
+    let inviteLink;
+    try {
+      inviteLink = await ctx.telegram.exportChatInviteLink(channelId);
+    } catch (error) {
+      debug.log('Could not get invite link, using fallback:', error);
+      inviteLink = username ? `https://t.me/${username}` : `(No invite link available)`;
+    }
+
+    // Save to database
+    try {
+      debug.log('Saving channel to database:', { channelId, title });
+      await Channel.create({
+        channelId,
+        title,
+        username,
+        inviteLink,
+        addedBy: ctx.from.id
+      });
+    } catch (error) {
+      debug.error('Database save failed:', error);
+      await ctx.reply('⚠️ Error saving channel to database');
+      return;
+    }
+
+    // Update in-memory list
+    if (!CHANNEL_IDS.includes(channelId)) {
+      CHANNEL_IDS.push(channelId);
+    }
+
+    // Success message
+    await ctx.replyWithMarkdown(
+      `✅ *Channel Added!*\n\n` +
+      `*Name:* ${title}\n` +
+      `*ID:* \`${channelId}\`\n` +
+      `*Link:* ${inviteLink}`,
+      Markup.inlineKeyboard([
+        Markup.button.callback("🏠 Menu", "MAIN_MENU"),
+        Markup.button.callback("🛠 Admin", "ADMIN_MENU")
+      ])
+    );
+
+    debug.log('Successfully added channel:', channelId);
+
+  } catch (error) {
+    debug.error('Channel add process failed:', error);
+    await ctx.reply('⚠️ An unexpected error occurred. Please try again');
+  } finally {
+    ctx.session.waitingForChannelAdd = false;
+    debug.log('Channel add process completed. Session:', ctx.session);
+  }
+});
+
+// 3. Add these critical debug commands:
+bot.command('channel_debug', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return;
+
+  const input = ctx.message.text.split(' ')[1];
+  if (!input) return ctx.reply('Please provide channel ID (@name or -100ID)');
+
+  try {
+    const chat = await ctx.telegram.getChat(input);
+    const botMember = await ctx.telegram.getChatMember(chat.id, ctx.botInfo.id);
+    const inDb = await Channel.findOne({ channelId: chat.id.toString() });
+
+    await ctx.replyWithMarkdown(
+      `🔍 *Channel Debug*\n\n` +
+      `*Title:* ${chat.title}\n` +
+      `*ID:* \`${chat.id}\`\n` +
+      `*Type:* ${chat.type}\n` +
+      `*Username:* ${chat.username || 'None'}\n` +
+      `*Bot Status:* ${botMember.status}\n` +
+      `*In Database:* ${inDb ? '✅' : '❌'}\n` +
+      `*In Memory:* ${CHANNEL_IDS.includes(chat.id.toString()) ? '✅' : '❌'}`
+    );
+  } catch (error) {
+    await ctx.reply(`Error: ${error.message}`);
+  }
+});
+
+bot.command('session_debug', (ctx) => {
+  ctx.replyWithMarkdown(`Current session:\n\`\`\`json\n${JSON.stringify(ctx.session, null, 2)}\n\`\`\``);
+});
+
+bot.on('message', (ctx) => {
+  console.log('Received message:', {
+    text: ctx.message.text,
+    forwardFrom: ctx.message.forward_from_chat,
+    from: ctx.from.id,
+    chat: ctx.chat.id
+  });
+});
+
+// Add these temporary commands for debugging
+bot.command('testadmin', async (ctx) => {
+  const chatId = ctx.message.text.split(' ')[1];
+  try {
+    const member = await ctx.telegram.getChatMember(chatId, ctx.botInfo.id);
+    ctx.reply(`Bot status in ${chatId}: ${member.status}`);
+  } catch (error) {
+    ctx.reply(`Error: ${error.message}`);
+  }
+});
+
+bot.command('debugforward', (ctx) => {
+  ctx.reply(`Last forwarded message: ${JSON.stringify(ctx.message.forward_from_chat)}`);
+});
+
+bot.command('checksession', (ctx) => {
+  ctx.reply(`Current session: ${JSON.stringify(ctx.session)}`);
+});
+
+// List Channels
+bot.action("LIST_CHANNELS", async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return;
+
+  const channels = await Channel.find().sort({ title: 1 });
+  if (channels.length === 0) {
+    await ctx.reply("ℹ️ No channels registered yet");
+    return;
+  }
+
+  let message = "📺 *Registered Channels*\n\n";
+  for (const channel of channels) {
+    try {
+      const isAdmin = await isBotAdminInChannel(channel.channelId);
+      message += `- ${channel.title} \`${channel.channelId}\` ${isAdmin ? '✅' : '❌'}\n`;
+    } catch {
+      message += `- ${channel.title} \`${channel.channelId}\` ❌\n`;
+    }
+  }
+
+  await ctx.replyWithMarkdown(message);
+});
+
+// Remove Channel
+bot.action("REMOVE_CHANNEL", async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return;
+
+  const channels = await Channel.find().sort({ title: 1 });
+  if (channels.length === 0) {
+    await ctx.reply("ℹ️ No channels to remove");
+    return;
+  }
+
+  const buttons = [];
+  // Show 3 channels per row
+  for (let i = 0; i < channels.length; i += 3) {
+    const row = [];
+    for (let j = 0; j < 3 && i + j < channels.length; j++) {
+      row.push(
+        Markup.button.callback(
+          `❌ ${channels[i + j].title.substring(0, 15)}`,
+          `REMOVE_CHANNEL_${channels[i + j]._id}`
+        )
+      );
+    }
+    buttons.push(row);
+  }
+  buttons.push([Markup.button.callback("🔙 Back", "ADMIN_CANCEL")]);
+
+  await ctx.reply(
+    "Select a channel to remove:",
+    Markup.inlineKeyboard(buttons)
+  );
+});
+
+// Handle Channel Removal
+bot.action(/^REMOVE_CHANNEL_(.+)$/, async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return;
+
+  const channelId = ctx.match[1];
+  try {
+    const channel = await Channel.findByIdAndDelete(channelId);
+    if (!channel) {
+      await ctx.reply("⚠️ Channel not found");
+      return;
+    }
+
+    // Update in-memory list
+    const index = CHANNEL_IDS.indexOf(channel.channelId);
+    if (index > -1) {
+      CHANNEL_IDS.splice(index, 1);
+    }
+
+    await ctx.replyWithMarkdown(
+      `🗑 *Channel Removed*\n\n` +
+      `*Name:* ${channel.title}\n` +
+      `*ID:* \`${channel.channelId}\``
+    );
+  } catch (error) {
+    console.error("Channel removal error:", error);
+    await ctx.reply("⚠️ Error removing channel");
+  } finally {
+    await showAdminMenu(ctx);
+  }
+});
+
+
+// Check if bot is admin in channel
+const isBotAdminInChannel = async (channelId) => {
+  try {
+    const chatMember = await bot.telegram.getChatMember(channelId, bot.botInfo.id);
+    return ['administrator', 'creator'].includes(chatMember.status);
+  } catch (error) {
+    console.error("Admin check error:", error);
+    return false;
+  }
+};
+
+// Refresh channel list from database
+const refreshChannelList = async () => {
+  try {
+    const channels = await Channel.find({});
+    CHANNEL_IDS = channels.map(c => c.channelId);
+    console.log(`Refreshed channel list, ${CHANNEL_IDS.length} channels`);
+  } catch (error) {
+    console.error("Error refreshing channel list:", error);
+  }
+};
+
+// Call this on bot startup
+refreshChannelList();
+
+
+
+// Broadcast execution
 const executeBroadcast = async (ctx, target, content) => {
   let success = 0;
   let failed = 0;
@@ -559,7 +969,8 @@ const executeBroadcast = async (ctx, target, content) => {
   try {
     await ctx.editMessageText("🔄 Sending broadcast...");
 
-    if (target === 'users' || target === 'both') {
+    // Broadcast to users
+    if (target === 'users' || target === 'all') {
       const users = await User.find({});
       for (const user of users) {
         try {
@@ -578,7 +989,8 @@ const executeBroadcast = async (ctx, target, content) => {
           broadcastMessages.push({
             messageId: message.message_id,
             chatId: message.chat.id,
-            content: content
+            content: content,
+            targetType: 'user'
           });
           success++;
           await new Promise(resolve => setTimeout(resolve, 100));
@@ -589,11 +1001,36 @@ const executeBroadcast = async (ctx, target, content) => {
       }
     }
 
-    if (target === 'groups' || target === 'both') {
-      // Implement your group broadcasting logic here
-      // For example, you might have a Group model with group IDs
-      // const groups = await Group.find({});
-      // Similar loop as above for groups
+    // Broadcast to channels
+    if (target === 'channels' || target === 'all') {
+      const channels = await Channel.find();
+      for (const channel of channels) {
+        try {
+          let message;
+          if (content.text) {
+            message = await ctx.telegram.sendMessage(channel.channelId, content.text);
+          } else {
+            if (content.type === "photo") {
+              message = await ctx.telegram.sendPhoto(channel.channelId, content.fileId, { caption: content.caption });
+            } else if (content.type === "video") {
+              message = await ctx.telegram.sendVideo(channel.channelId, content.fileId, { caption: content.caption });
+            } else if (content.type === "document") {
+              message = await ctx.telegram.sendDocument(channel.channelId, content.fileId, { caption: content.caption });
+            }
+          }
+          broadcastMessages.push({
+            messageId: message.message_id,
+            chatId: message.chat.id,
+            content: content,
+            targetType: 'channel'
+          });
+          success++;
+          await new Promise(resolve => setTimeout(resolve, 100));
+        } catch (error) {
+          console.error(`Failed to send to channel ${channel.channelId}:`, error);
+          failed++;
+        }
+      }
     }
 
     // Save broadcast messages for possible deletion
@@ -618,12 +1055,12 @@ bot.action("CONFIRM_BROADCAST_TEXT_USERS", async (ctx) => {
   await executeBroadcast(ctx, 'users', { text: ctx.session.broadcastData.text });
 });
 
-bot.action("CONFIRM_BROADCAST_TEXT_GROUPS", async (ctx) => {
-  await executeBroadcast(ctx, 'groups', { text: ctx.session.broadcastData.text });
+bot.action("CONFIRM_BROADCAST_TEXT_CHANNELS", async (ctx) => {
+  await executeBroadcast(ctx, 'channels', { text: ctx.session.broadcastData.text });
 });
 
-bot.action("CONFIRM_BROADCAST_TEXT_BOTH", async (ctx) => {
-  await executeBroadcast(ctx, 'both', { text: ctx.session.broadcastData.text });
+bot.action("CONFIRM_BROADCAST_TEXT_ALL", async (ctx) => {
+  await executeBroadcast(ctx, 'all', { text: ctx.session.broadcastData.text });
 });
 
 // Media broadcast handlers
@@ -631,12 +1068,12 @@ bot.action("CONFIRM_BROADCAST_MEDIA_USERS", async (ctx) => {
   await executeBroadcast(ctx, 'users', ctx.session.broadcastData);
 });
 
-bot.action("CONFIRM_BROADCAST_MEDIA_GROUPS", async (ctx) => {
-  await executeBroadcast(ctx, 'groups', ctx.session.broadcastData);
+bot.action("CONFIRM_BROADCAST_MEDIA_CHANNELS", async (ctx) => {
+  await executeBroadcast(ctx, 'channels', ctx.session.broadcastData);
 });
 
-bot.action("CONFIRM_BROADCAST_MEDIA_BOTH", async (ctx) => {
-  await executeBroadcast(ctx, 'both', ctx.session.broadcastData);
+bot.action("CONFIRM_BROADCAST_MEDIA_ALL", async (ctx) => {
+  await executeBroadcast(ctx, 'all', ctx.session.broadcastData);
 });
 
 // Delete broadcast handler
@@ -656,7 +1093,7 @@ bot.action("ADMIN_DELETE_BROADCAST", async (ctx) => {
 
   const buttons = broadcasts.map(broadcast => [
     Markup.button.callback(
-      `🗑 ${new Date(broadcast.sentAt).toLocaleString()}`,
+      `🗑 ${new Date(broadcast.sentAt).toLocaleString()} (${broadcast.targetType})`,
       `DELETE_BROADCAST_${broadcast._id}`
     )
   ]);
@@ -712,13 +1149,15 @@ bot.action("ADMIN_STATS", async (ctx) => {
     const premiumCount = await User.countDocuments({ isPremium: true });
     const videoCount = await Video.countDocuments();
     const groupAccessCount = await User.countDocuments({ hasPurchaseGroupAccess: true });
+    const channelCount = await Channel.countDocuments();
 
     await ctx.reply(
       `📊 Bot Statistics:\n\n` +
       `👥 Total Users: ${userCount}\n` +
       `💎 Premium Users: ${premiumCount}\n` +
       `👑 Purchase Group Members: ${groupAccessCount}\n` +
-      `🎥 Videos Available: ${videoCount}`
+      `🎥 Videos Available: ${videoCount}\n` +
+      `📺 Registered Channels: ${channelCount}`
     );
   } catch (error) {
     console.error("Error getting stats:", error);
@@ -734,12 +1173,21 @@ bot.catch((err, ctx) => {
 
 // Start bot
 bot.launch()
-  .then(() => {
-    console.log("🚀 Bot running successfully");
-    // Initial cleanup of inactive users
-    cleanInactiveUsers();
-  })
-  .catch(err => console.error("❌ Bot failed to start:", err));
+.then(() => {
+  console.log("🚀 Bot running successfully");
+  // Initial cleanup and refresh
+  cleanInactiveUsers();
+  refreshChannelList();
+  // Debug info
+  debug.log('Bot started with config:', {
+    admins,
+    CHANNEL_IDS,
+    botInfo: bot.botInfo
+  });
+  // Refresh channels every hour
+  setInterval(refreshChannelList, 3600000);
+})
+.catch(err => console.error("❌ Bot failed to start:", err));
 
 // Graceful shutdown
 process.once('SIGINT', () => bot.stop('SIGINT'));
