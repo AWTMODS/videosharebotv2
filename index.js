@@ -137,8 +137,8 @@ const sendUPIDetails = async (ctx, paymentType) => {
   ctx.session.currentMenu = 'payment';
 
   const caption = paymentType === 'group' 
-    ? `💳 *Purchase Group Access (${PURCHASE_GROUP_PRICE})*\n\n1. Scan the QR or copy UPI ID\n2. Send payment proof to verify`
-    : `💳 *Premium Subscription*\n\n1. Scan the QR or copy UPI ID\n2. Send payment proof to verify`;
+    ? `💳 *Purchase Group Access (${PURCHASE_GROUP_PRICE})*\n\n1. Scan the QR or copy UPI ID\n2. Send payment proof to get the group link`
+    : `💳 *Premium Subscription*\n\n1. Scan the QR or copy UPI ID\n2. Send payment proof to get the premium(must)`;
 
   const buttons = [
     [Markup.button.callback("📋 Copy UPI ID", "COPY_UPI")],
@@ -384,74 +384,201 @@ bot.action("COPY_UPI", async (ctx) => {
   });
 });
 
-// Payment proof handler
+// Payment proof handler - improved version
 bot.on("photo", async (ctx) => {
+  // Only handle private messages from non-admins
   if (ctx.chat.type !== 'private' || isAdmin(ctx.from.id)) return;
 
   ctx.session = ctx.session || {};
 
+  // Check if we're expecting a payment proof
   if (ctx.session.waitingForPaymentProof) {
-    await forwardPaymentToAdmin(ctx, ctx.session.waitingForPaymentProof);
-    ctx.session.waitingForPaymentProof = null;
+    try {
+      await forwardPaymentToAdmin(ctx, ctx.session.waitingForPaymentProof);
+      ctx.session.waitingForPaymentProof = null;
+    } catch (error) {
+      console.error("Payment proof handling error:", error);
+      await ctx.reply("⚠️ Failed to process your payment proof. Please try again.");
+    }
   }
 });
 
+// Improved forwarding function
 async function forwardPaymentToAdmin(ctx, paymentType) {
   const userId = ctx.from.id;
+  const user = await User.findOne({ userId }) || {};
+
+  // Better caption with more user info
   const caption = paymentType === 'group'
-    ? `🧾 Purchase Group Payment from [${ctx.from.first_name}](tg://user?id=${userId})`
-    : `🧾 Premium Payment from [${ctx.from.first_name}](tg://user?id=${userId})`;
+    ? `🧾 *Purchase Group Payment*\n\n` +
+      `• From: [${escapeHtml(ctx.from.first_name)}](tg://user?id=${userId})\n` +
+      `• Username: ${user.username ? '@' + user.username : 'None'}\n` +
+      `• User ID: \`${userId}\`\n` +
+      `• Amount: ${PURCHASE_GROUP_PRICE}`
+    : `🧾 *Premium Payment*\n\n` +
+      `• From: [${escapeHtml(ctx.from.first_name)}](tg://user?id=${userId})\n` +
+      `• Username: ${user.username ? '@' + user.username : 'None'}\n` +
+      `• User ID: \`${userId}\``;
 
   const buttons = Markup.inlineKeyboard([
-    Markup.button.callback("✅ Verify", `VERIFY_${userId}_${paymentType.toUpperCase()}`),
-    Markup.button.callback("❌ Reject", `REJECT_${userId}`)
+    [
+      Markup.button.callback("✅ Approve", `VERIFY_${userId}_${paymentType.toUpperCase()}`),
+      Markup.button.callback("❌ Reject", `REJECT_${userId}`)
+    ],
+    [
+      Markup.button.callback("🗂 View User", `VIEW_USER_${userId}`)
+    ]
   ]);
 
-  await ctx.forwardMessage(process.env.ADMIN_GROUP_ID);
-  await bot.telegram.sendMessage(process.env.ADMIN_GROUP_ID, caption, { 
-    parse_mode: "Markdown", 
-    ...buttons 
-  });
+  try {
+    // 1. Forward the original photo
+    await ctx.telegram.forwardMessage(
+      process.env.ADMIN_GROUP_ID,
+      ctx.chat.id,
+      ctx.message.message_id
+    );
 
-  await ctx.reply("✅ Payment proof received! Admin will verify within 24 hours.");
+    // 2. Send the info message with action buttons
+    await ctx.telegram.sendMessage(
+      process.env.ADMIN_GROUP_ID,
+      caption,
+      {
+        parse_mode: "MarkdownV2",
+        reply_markup: buttons.reply_markup,
+        disable_web_page_preview: true
+      }
+    );
+
+    // 3. Confirm to user
+    await ctx.reply(
+      "✅ Payment proof received! Our team will verify it within 24 hours.\n\n" +
+      "You'll receive a confirmation message once approved.",
+      Markup.inlineKeyboard([
+        Markup.button.url("📞 Contact Support", "https://t.me/stephinjk")
+      ])
+    );
+
+  } catch (error) {
+    console.error("Payment forwarding error:", error);
+    throw error; // Let the calling function handle it
+  }
 }
 
-// Verification handlers
+// Enhanced verification handlers
 bot.action(/^VERIFY_(\d+)_(GROUP|PREMIUM)$/, async (ctx) => {
-  if (!isAdmin(ctx.from.id)) return;
+  if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery("❌ Admin only");
 
-  const userId = ctx.match[1];
+  const userId = parseInt(ctx.match[1]);
   const verifyType = ctx.match[2].toLowerCase();
+  const user = await User.findOne({ userId });
 
-  if (verifyType === 'group') {
-    await User.findOneAndUpdate({ userId }, { hasPurchaseGroupAccess: true });
-    await ctx.reply(`✅ User ${userId} granted purchase group access.`);
-    await bot.telegram.sendMessage(userId, `🎉 Purchase group access approved! Join here: ${PURCHASE_GROUP_LINK}`);
-  } else {
-    await User.findOneAndUpdate({ userId }, { isPremium: true });
-    await ctx.reply(`✅ User ${userId} marked as premium.`);
-    await bot.telegram.sendMessage(userId, "🎉 You are now a premium member! Enjoy unlimited videos.");
+  if (!user) {
+    return ctx.answerCbQuery("❌ User not found");
   }
 
   try {
-    await ctx.deleteMessage();
+    if (verifyType === 'group') {
+      await User.updateOne({ userId }, { hasPurchaseGroupAccess: true });
+      await ctx.answerCbQuery("✅ Access granted");
+      await ctx.editMessageText(
+        `✅ *Purchase Group Access Granted*\n\n` +
+        `User: [${user.first_name || 'Unknown'}](tg://user?id=${userId})\n` +
+        `Username: ${user.username ? '@' + user.username : 'None'}\n` +
+        `Approved by: @${ctx.from.username || ctx.from.first_name}`,
+        { parse_mode: "MarkdownV2" }
+      );
+      await bot.telegram.sendMessage(
+        userId,
+        `🎉 *Purchase Group Access Approved!*\n\n` +
+        `You can now join our exclusive group:\n${PURCHASE_GROUP_LINK}`,
+        { parse_mode: "Markdown" }
+      );
+    } else {
+      await User.updateOne({ userId }, { isPremium: true });
+      await ctx.answerCbQuery("✅ Premium granted");
+      await ctx.editMessageText(
+        `✅ *Premium Access Granted*\n\n` +
+        `User: [${user.first_name || 'Unknown'}](tg://user?id=${userId})\n` +
+        `Username: ${user.username ? '@' + user.username : 'None'}\n` +
+        `Approved by: @${ctx.from.username || ctx.from.first_name}`,
+        { parse_mode: "MarkdownV2" }
+      );
+      await bot.telegram.sendMessage(
+        userId,
+        "🎉 *You are now a Premium Member!*\n\n" +
+        "Enjoy unlimited access to all content!",
+        { parse_mode: "Markdown" }
+      );
+    }
   } catch (error) {
-    console.error("Error deleting verification message:", error);
+    console.error("Verification error:", error);
+    await ctx.answerCbQuery("⚠️ Error processing");
   }
 });
 
+// Enhanced rejection handler
 bot.action(/^REJECT_(\d+)$/, async (ctx) => {
-  if (!isAdmin(ctx.from.id)) return;
+  if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery("❌ Admin only");
 
-  const userId = ctx.match[1];
-  await ctx.reply(`❌ Payment from ${userId} rejected.`);
-  await bot.telegram.sendMessage(userId, "⚠️ Your payment was rejected. Please contact support.");
+  const userId = parseInt(ctx.match[1]);
+  const user = await User.findOne({ userId });
+
+  if (!user) {
+    return ctx.answerCbQuery("❌ User not found");
+  }
 
   try {
-    await ctx.deleteMessage();
+    await ctx.answerCbQuery("❌ Payment rejected");
+    await ctx.editMessageText(
+      `❌ *Payment Rejected*\n\n` +
+      `User: [${user.first_name || 'Unknown'}](tg://user?id=${userId})\n` +
+      `Username: ${user.username ? '@' + user.username : 'None'}\n` +
+      `Rejected by: @${ctx.from.username || ctx.from.first_name}`,
+      { parse_mode: "MarkdownV2" }
+    );
+
+    await bot.telegram.sendMessage(
+      userId,
+      "⚠️ *Payment Rejected*\n\n" +
+      "Your payment proof was not approved. Possible reasons:\n" +
+      "• Unclear/incorrect payment screenshot\n" +
+      "• Payment amount mismatch\n" +
+      "• Other verification issues\n\n" +
+      "Please contact support if you believe this was a mistake:\n" +
+      "https://t.me/your_support",
+      { parse_mode: "Markdown" }
+    );
   } catch (error) {
-    console.error("Error deleting rejection message:", error);
+    console.error("Rejection error:", error);
+    await ctx.answerCbQuery("⚠️ Error processing");
   }
+});
+
+// Additional user view handler
+bot.action(/^VIEW_USER_(\d+)$/, async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery("❌ Admin only");
+
+  const userId = parseInt(ctx.match[1]);
+  const user = await User.findOne({ userId });
+
+  if (!user) {
+    return ctx.answerCbQuery("❌ User not found");
+  }
+
+  await ctx.answerCbQuery(`👤 Viewing user ${userId}`);
+
+  const userInfo = `
+👤 *User Information*
+
+• Name: [${user.first_name || 'Unknown'}](tg://user?id=${userId})
+• Username: ${user.username ? '@' + user.username : 'None'}
+• User ID: \`${userId}\`
+• Premium: ${user.isPremium ? '✅' : '❌'}
+• Group Access: ${user.hasPurchaseGroupAccess ? '✅' : '❌'}
+• Videos Viewed: ${user.viewedVideos?.length || 0}
+  `;
+
+  await ctx.replyWithMarkdownV2(userInfo);
 });
 
 // Admin broadcast handlers
